@@ -2,7 +2,7 @@ mod db;
 mod niri;
 
 use clap::{Parser, Subcommand};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process;
 use std::thread;
 use std::time::Duration;
@@ -66,18 +66,63 @@ fn run_watch(db_path: &str, interval_secs: u64) {
             }
         };
 
-        let mut changed = 0usize;
-        for w in &windows {
+        // Sort so dedup below is deterministic — always keeps lowest ID per (app, title)
+        let mut sorted_windows = windows.clone();
+        sorted_windows.sort_by_key(|w| (w.app_id.clone(), w.title.clone(), w.id));
+
+        let mut changes: Vec<String> = Vec::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        for w in &sorted_windows {
+            let key = format!("{}|{}", w.app_id, w.title);
+            if !seen_keys.insert(key) {
+                continue;
+            }
             let pos = w.layout.pos_in_scrolling_layout[0];
-            match db::insert_if_changed(&conn, &w.app_id, &w.title, w.workspace_id, pos) {
-                Ok(true) => changed += 1,
-                Ok(false) => {}
-                Err(e) => eprintln!("DB insert error: {e}"),
+            let changed = match db::find_last(&conn, &w.app_id, &w.title, Some(pos)) {
+                Ok(Some((old_ws, _))) => {
+                    // Position matched, only compare workspace
+                    if old_ws != w.workspace_id {
+                        Some(old_ws)
+                    } else {
+                        None
+                    }
+                }
+                Ok(None) => {
+                    // No record at this position — new window or position changed
+                    Some(w.workspace_id) // triggers insert; detected below
+                }
+                Err(e) => {
+                    eprintln!("DB query error: {e}");
+                    None
+                }
+            };
+
+            if let Some(old_ws) = changed {
+                match db::insert_if_changed(&conn, &w.app_id, &w.title, w.workspace_id, pos) {
+                    Ok(true) => {
+                        if old_ws == w.workspace_id {
+                            changes.push(
+                                format!("  Window {:>4} \"{}\" [{}]: new (ws={}, pos={})",
+                                    w.id, w.title, w.app_id, w.workspace_id, pos),
+                            );
+                        } else {
+                            changes.push(
+                                format!("  Window {:>4} \"{}\" [{}]: ws: {}→{}",
+                                    w.id, w.title, w.app_id, old_ws, w.workspace_id),
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("DB insert error: {e}"),
+                }
             }
         }
 
-        if changed > 0 {
-            eprintln!("Recorded {changed} window change(s)");
+        if !changes.is_empty() {
+            println!("Window change(s):");
+            for line in &changes {
+                println!("{line}");
+            }
         }
 
         thread::sleep(interval);
@@ -110,46 +155,66 @@ fn run_restore(db_path: &str) {
     };
 
     // 3. For each window, find its last known (workspace, position) from DB.
-    //    Only restore windows whose target differs from current state.
+    //    Prefer records whose position matches the current position (for windows with
+    //    identical app_id+title, e.g. two Telegram windows). Fall back to closest
+    //    position, or the most recent record if nothing else matches.
     //    Each entry: (window_id, target_workspace, target_position).
     let mut to_restore: Vec<(u64, i64, i64)> = Vec::new();
 
+    // Collect DB records per (app, title) to avoid re-querying
+    let mut record_cache: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    // Deduplicate by (app, title) — multiple identical windows cause ping-pong restore
+    let mut seen_keys: HashSet<String> = HashSet::new();
+
     for w in &windows {
-        match db::find_last(&conn, &w.app_id, &w.title) {
-            Ok(Some((target_ws, target_pos))) => {
-                let cur_ws = w.workspace_id;
-                let cur_pos = w.layout.pos_in_scrolling_layout[0];
-                eprintln!(
-                    "  Window {:>4} \"{}\" [{}]: DB record found — workspace={}, position={}{}",
-                    w.id,
-                    w.title,
-                    w.app_id,
-                    target_ws,
-                    target_pos,
-                    if target_ws != cur_ws || target_pos != cur_pos {
-                        format!(
-                            " (current ws={}, pos={}; needs restore)",
-                            cur_ws, cur_pos
-                        )
-                    } else {
-                        " (already matches current state; skipped)".to_string()
-                    }
-                );
+        let cur_ws = w.workspace_id;
+        let cur_pos = w.layout.pos_in_scrolling_layout[0];
+        let key = format!("{}|{}", w.app_id, w.title);
+        if !seen_keys.insert(key.clone()) {
+            eprintln!(
+                "  Window {:>4} \"{}\" [{}]: duplicate of another window — skipping",
+                w.id, w.title, w.app_id
+            );
+            continue;
+        }
+
+        let records = record_cache.entry(key).or_insert_with(|| {
+            db::find_all_positions(&conn, &w.app_id, &w.title).unwrap_or_default()
+        });
+
+        if records.is_empty() {
+            eprintln!(
+                "  Window {:>4} \"{}\" [{}]: no DB records found — skipping",
+                w.id, w.title, w.app_id
+            );
+            continue;
+        }
+
+        // Find best matching record: exact position match, closest position, or most recent
+        let best = records
+            .iter()
+            .find(|(_, pos)| *pos == cur_pos)           // exact match
+            .or_else(|| records.iter().min_by_key(|(_, pos)| (pos - cur_pos).abs())) // closest
+            .copied();                                    // fallback never needed since records not empty
+
+        if let Some((target_ws, target_pos)) = best {
+            let matched = if target_pos == cur_pos { "pos match" } else { "closest pos" };
+            eprintln!(
+                "  Window {:>4} \"{}\" [{}]: DB record found ({}) — workspace={}, position={}{}",
+                w.id,
+                w.title,
+                w.app_id,
+                matched,
+                target_ws,
+                target_pos,
                 if target_ws != cur_ws || target_pos != cur_pos {
-                    to_restore.push((w.id, target_ws, target_pos));
+                    format!(" (current ws={}, pos={}; needs restore)", cur_ws, cur_pos)
+                } else {
+                    " (already matches; skipped)".to_string()
                 }
-            }
-            Ok(None) => {
-                eprintln!(
-                    "  Window {:>4} \"{}\" [{}]: no DB record found — skipping",
-                    w.id, w.title, w.app_id
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "  Window {:>4} \"{}\" [{}]: DB query error: {e} — skipping",
-                    w.id, w.title, w.app_id
-                );
+            );
+            if target_ws != cur_ws || target_pos != cur_pos {
+                to_restore.push((w.id, target_ws, target_pos));
             }
         }
     }
