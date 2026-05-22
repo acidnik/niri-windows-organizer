@@ -117,12 +117,40 @@ fn run_restore(db_path: &str) {
     for w in &windows {
         match db::find_last(&conn, &w.app_id, &w.title) {
             Ok(Some((target_ws, target_pos))) => {
-                // If workspace or position changed, queue for restore
-                if target_ws != w.workspace_id || target_pos != w.layout.pos_in_scrolling_layout[0] {
+                let cur_ws = w.workspace_id;
+                let cur_pos = w.layout.pos_in_scrolling_layout[0];
+                eprintln!(
+                    "  Window {:>4} \"{}\" [{}]: DB record found — workspace={}, position={}{}",
+                    w.id,
+                    w.title,
+                    w.app_id,
+                    target_ws,
+                    target_pos,
+                    if target_ws != cur_ws || target_pos != cur_pos {
+                        format!(
+                            " (current ws={}, pos={}; needs restore)",
+                            cur_ws, cur_pos
+                        )
+                    } else {
+                        " (already matches current state; skipped)".to_string()
+                    }
+                );
+                if target_ws != cur_ws || target_pos != cur_pos {
                     to_restore.push((w.id, target_ws, target_pos));
                 }
             }
-            _ => {}
+            Ok(None) => {
+                eprintln!(
+                    "  Window {:>4} \"{}\" [{}]: no DB record found — skipping",
+                    w.id, w.title, w.app_id
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "  Window {:>4} \"{}\" [{}]: DB query error: {e} — skipping",
+                    w.id, w.title, w.app_id
+                );
+            }
         }
     }
 
