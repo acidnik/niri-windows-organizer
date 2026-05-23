@@ -145,21 +145,12 @@ fn run_restore(db_path: &str) {
         }
     };
 
-    // 2. Get existing workspace indices (sorted ascending)
-    let workspace_indices = match niri::get_workspace_indices() {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Error getting workspaces: {e}");
-            process::exit(1);
-        }
-    };
-
-    // 3. For each window, find its last known (workspace, position) from DB.
+    // 2. For each window, find its last known (workspace, position) from DB.
     //    Prefer records whose position matches the current position (for windows with
     //    identical app_id+title, e.g. two Telegram windows). Fall back to closest
     //    position, or the most recent record if nothing else matches.
-    //    Each entry: (window_id, target_workspace, target_position).
-    let mut to_restore: Vec<(u64, i64, i64)> = Vec::new();
+    //    Each entry: (window_id, app_id, title, target_workspace, target_position).
+    let mut to_restore: Vec<(u64, String, String, i64, i64)> = Vec::new();
 
     // Collect DB records per (app, title) to avoid re-querying
     let mut record_cache: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
@@ -214,7 +205,7 @@ fn run_restore(db_path: &str) {
                 }
             );
             if target_ws != cur_ws || target_pos != cur_pos {
-                to_restore.push((w.id, target_ws, target_pos));
+                to_restore.push((w.id, w.app_id.clone(), w.title.clone(), target_ws, target_pos));
             }
         }
     }
@@ -224,37 +215,14 @@ fn run_restore(db_path: &str) {
         return;
     }
 
-    // 4. Sort: first by target workspace (ascending), then by position (ascending).
-    //    This way we fill lower workspaces first and place windows left-to-right.
-    to_restore.sort_by_key(|(_, ws, pos)| (*ws, *pos));
+    // 3. Sort: first by target workspace (ascending), then by position (ascending).
+    //    This fills lower workspaces first and places windows left-to-right.
+    to_restore.sort_by_key(|(_, _, _, ws, pos)| (*ws, *pos));
 
-    // 5. Apply moves.
-    //    Before moving to workspace N, ensure workspaces 2..N-1 have at least
-    //    one window. If a gap exists, redirect to the lowest empty workspace.
-    let mut occupied: HashSet<i64> = HashSet::new();
-
-    for (win_id, target_ws, target_pos) in &to_restore {
-        // Find the lowest workspace idx >= 2 that is not yet occupied.
-        let lowest_free = workspace_indices
-            .iter()
-            .copied()
-            .skip_while(|idx| *idx < 2)
-            .find(|idx| !occupied.contains(idx))
-            .unwrap_or(2);
-
-        let adjusted_ws = if *target_ws > lowest_free {
-            lowest_free
-        } else {
-            *target_ws
-        };
-
-        match niri::move_window_to_workspace(*win_id, adjusted_ws) {
+    // 4. Apply moves. niri auto-creates workspaces when a window is moved to one.
+    for (win_id, app_id, title, target_ws, target_pos) in &to_restore {
+        match niri::move_window_to_workspace(*win_id, *target_ws) {
             Ok(()) => {
-                eprintln!(
-                    "Moved window {} to workspace {} (pos {}, original target ws {})",
-                    win_id, adjusted_ws, target_pos, target_ws
-                );
-                occupied.insert(adjusted_ws);
                 thread::sleep(Duration::from_millis(200));
             }
             Err(e) => {
@@ -263,21 +231,30 @@ fn run_restore(db_path: &str) {
             }
         }
 
-        // 6. Position the window left-to-right on its (possibly adjusted) workspace.
-        //    We use move-column-to-index with (target_pos - 1) because niri uses 0-based index.
-        let idx = (target_pos - 1).max(0);
+        // 5. Position the window left-to-right on its workspace.
+        //    move-column-to-index uses a 0-based index.
+        let idx = (*target_pos - 1).max(0);
         if idx > 0 {
-            // Focus the window we just moved (it should be focused already)
-            // and move its column to the desired index.
             match niri::move_focused_column_to_index(idx) {
                 Ok(()) => {
-                    eprintln!("  Positioned column at index {}", idx);
+                    eprintln!(
+                        "Moved window {} \"{}\" [{}] → ws {} (pos {})",
+                        win_id, title, app_id, target_ws, target_pos
+                    );
                 }
                 Err(e) => {
-                    eprintln!("  Failed to position column: {e}");
+                    eprintln!(
+                        "Moved window {} \"{}\" [{}] → ws {} (column pos skipped: {e})",
+                        win_id, title, app_id, target_ws
+                    );
                 }
             }
             thread::sleep(Duration::from_millis(150));
+        } else {
+            eprintln!(
+                "Moved window {} \"{}\" [{}] → ws {} (pos {})",
+                win_id, title, app_id, target_ws, target_pos
+            );
         }
     }
 

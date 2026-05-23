@@ -108,6 +108,7 @@ pub struct Workspace {
     pub active_window_id: Option<u64>,
 }
 
+#[allow(dead_code)]
 pub fn get_workspace_indices() -> Result<Vec<i64>, String> {
     let output = Command::new("niri")
         .args(["msg", "--json", "workspaces"])
